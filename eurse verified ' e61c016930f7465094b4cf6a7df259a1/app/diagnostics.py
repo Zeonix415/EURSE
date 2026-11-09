@@ -1,0 +1,84 @@
+"""Bounded local diagnostics and text export."""
+from datetime import UTC, datetime
+import json
+from pathlib import Path
+import threading
+
+LIMIT = 128 * 1024
+FIELDS = {'phase', 'seconds', 'changed', 'baseline', 'result', 'version'}
+EVENTS = {'armed', 'trial', 'connect', 'reply', 'connected', 'ended', 'cleanup',
+          'error', 'stopping', 'startup', 'route_failed',
+          'budget_limit', 'retry_limit', 'game_exit', 'auto_stop'}
+
+
+def safe_text(value):
+    """True for short ASCII identifiers; anything else is never logged or exported."""
+    return isinstance(value, str) and value.isascii() and len(value) <= 48 and all(c.isalnum() or c in '_-.' for c in value)
+
+
+class Diagnostics:
+    def __init__(self, directory, enabled=True):
+        self.directory = Path(directory)
+        self.enabled = enabled
+        self.lock = threading.Lock()
+
+    def emit(self, event, **fields):
+        if not self.enabled or event not in EVENTS:
+            return
+        record = {'time': datetime.now(UTC).isoformat(timespec='milliseconds'), 'event': event}
+        for key, value in fields.items():
+            if key not in FIELDS:
+                continue
+            if isinstance(value, (bool, int, float)) or safe_text(value):
+                record[key] = value
+        raw = (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
+        try:
+            with self.lock:
+                self.directory.mkdir(parents=True, exist_ok=True)
+                path = self.directory / 'diagnostics.jsonl'
+                if path.exists() and path.stat().st_size + len(raw) > LIMIT:
+                    path.replace(self.directory / 'diagnostics.previous.jsonl')
+                with path.open('ab') as stream:
+                    stream.write(raw)
+        except OSError:
+            # Diagnostics must never break a recovered connection.
+            pass
+
+
+def export(directory, destination):
+    """Export allowlisted fields with bounded input and output."""
+    clean = []
+    remaining = LIMIT
+    for name in ('diagnostics.jsonl', 'diagnostics.previous.jsonl'):
+        path = Path(directory) / name
+        if not path.exists():
+            continue
+        with path.open('rb') as stream:
+            raw = stream.read(LIMIT)
+        for line in raw.splitlines():
+            if len(line) > 1024:
+                continue
+            try:
+                row = json.loads(line)
+                if not isinstance(row, dict) or row.get('event') not in EVENTS:
+                    continue
+                # Treat local files as untrusted. Re-export only controlled values.
+                safe = {'event': row['event']}
+                stamp = row.get('time', '')
+                if isinstance(stamp, str) and len(stamp) < 40:
+                    datetime.fromisoformat(stamp)
+                    safe['time'] = stamp
+                for key in FIELDS:
+                    value = row.get(key)
+                    if isinstance(value, (bool, int, float)) or safe_text(value):
+                        safe[key] = value
+                text = json.dumps(safe, separators=(',', ':')) + '\n'
+                size = len(text.encode('utf-8'))
+                if size > remaining:
+                    break
+                clean.append(text)
+                remaining -= size
+            except (ValueError, TypeError, RecursionError):
+                continue
+    Path(destination).write_bytes(''.join(clean).encode('utf-8'))
+    return len(clean)
